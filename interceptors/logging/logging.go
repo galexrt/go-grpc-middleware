@@ -180,8 +180,17 @@ func ExtractFields(ctx context.Context) Fields {
 // popular fields like grpc.component (e.g. server invoking gRPC client).
 //
 // Don't overuse mutation of fields to avoid surprises.
+// This function is not safe to call concurrently.
 func InjectFields(ctx context.Context, f Fields) context.Context {
-	return context.WithValue(ctx, fieldsCtxMarkerKey, &fieldsCtxValue{fields: f.WithUnique(ExtractFields(ctx))})
+	t, ok := ctx.Value(fieldsCtxMarkerKey).(*fieldsCtxValue)
+	if !ok {
+		t = &fieldsCtxValue{
+			fields: f,
+		}
+		return context.WithValue(ctx, fieldsCtxMarkerKey, t)
+	}
+	t.fields = t.fields.AppendUnique(f)
+	return ctx
 }
 
 // InjectLogField is like InjectFields, just for one field.
