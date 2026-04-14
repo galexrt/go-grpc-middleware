@@ -31,6 +31,7 @@ var (
 
 	certPEM []byte
 	keyPEM  []byte
+	caPEM   []byte
 )
 
 // InterceptorTestSuite is a testify/Suite that starts a gRPC PingService server and a client.
@@ -59,15 +60,15 @@ func (s *InterceptorTestSuite) SetupSuite() {
 
 	s.serverAddr = "127.0.0.1:0"
 	var err error
-	certPEM, keyPEM, err = generateCertAndKey([]string{"localhost", "example.com"})
+	certPEM, keyPEM, caPEM, err = generateCertAndKey([]string{"localhost", "example.com"})
 	s.Require().NoError(err, "unable to generate test certificate/key")
 
 	go func() {
 		for {
 			var err error
 			s.ServerListener, err = net.Listen("tcp", s.serverAddr)
-			s.serverAddr = s.ServerListener.Addr().String()
 			s.Require().NoError(err, "must be able to allocate a port for serverListener")
+			s.serverAddr = s.ServerListener.Addr().String()
 			if *flagTls {
 				cert, err := tls.X509KeyPair(certPEM, keyPEM)
 				s.Require().NoError(err, "unable to load test TLS certificate")
@@ -120,7 +121,7 @@ func (s *InterceptorTestSuite) NewClient(dialOpts ...grpc.DialOption) TestServic
 	var err error
 	if *flagTls {
 		cp := x509.NewCertPool()
-		if !cp.AppendCertsFromPEM(certPEM) {
+		if !cp.AppendCertsFromPEM(caPEM) {
 			s.T().Fatal("failed to append certificate")
 		}
 		creds := credentials.NewTLS(&tls.Config{ServerName: "localhost", RootCAs: cp})
@@ -228,20 +229,55 @@ func (s *InterceptorTestSuite) TearDownSuite() {
 
 // generateCertAndKey copied from https://github.com/johanbrandhorst/certify/blob/master/issuers/vault/vault_suite_test.go#L255
 // with minor modifications.
-func generateCertAndKey(san []string) ([]byte, []byte, error) {
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return nil, nil, err
-	}
-	notBefore := time.Now()
+func generateCertAndKey(san []string) ([]byte, []byte, []byte, error) {
+	notBefore := time.Now().Add(-1 * time.Minute)
 	notAfter := notBefore.Add(time.Hour)
-	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+
+	// Root CA
+	caPriv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	template := x509.Certificate{
-		SerialNumber: serialNumber,
+
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	caSerial, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	caTemplate := x509.Certificate{
+		SerialNumber: caSerial,
+		Subject: pkix.Name{
+			CommonName: "example.com Test Root CA",
+		},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLen:            0,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, caPriv.Public(), caPriv)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	caOut := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: caDER,
+	})
+
+	// Server leaf certificate signed by the CA
+	leafPriv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	leafSerial, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	leafTemplate := x509.Certificate{
+		SerialNumber: leafSerial,
 		Subject: pkix.Name{
 			CommonName: "example.com",
 		},
@@ -252,18 +288,19 @@ func generateCertAndKey(san []string) ([]byte, []byte, error) {
 		BasicConstraintsValid: true,
 		DNSNames:              san,
 	}
-	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, priv.Public(), priv)
+	leafDER, err := x509.CreateCertificate(rand.Reader, &leafTemplate, &caTemplate, leafPriv.Public(), caPriv)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
+
 	certOut := pem.EncodeToMemory(&pem.Block{
 		Type:  "CERTIFICATE",
-		Bytes: derBytes,
+		Bytes: leafDER,
 	})
 	keyOut := pem.EncodeToMemory(&pem.Block{
 		Type:  "RSA PRIVATE KEY",
-		Bytes: x509.MarshalPKCS1PrivateKey(priv),
+		Bytes: x509.MarshalPKCS1PrivateKey(leafPriv),
 	})
 
-	return certOut, keyOut, nil
+	return certOut, keyOut, caOut, nil
 }
